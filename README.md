@@ -28,7 +28,7 @@ pnpm i koishi-plugin-opencode-modified --workspace
 即可正确安装在环境中，即可以在WebUI中编辑参数和查看日志等。
 
 
-# 开源证书（继承）
+## 开源证书（继承）
 
 MIT License
 
