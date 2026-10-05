@@ -1019,32 +1019,42 @@ function parseModel(modelStr: string): { id: string; providerID: string } {
   return { providerID: parts[0], id: parts[1] }
 }
 
-let isSubscribed = false
+// 同一时刻只能存在一个事件流循环。
+// 之前用一个模块级布尔量做守卫：插件重载时 dispose 把它置 false，紧接着新的
+// apply 又把它置 true，于是**旧循环以为仍然有效而继续运行**，与新循环并存——
+// 每个事件被处理两次，同一条回复也就发了两遍。
+// 这里改为可取消的“单实例”令牌，保证任何时候至多一个订阅在消费事件。
+let stopActiveStream: (() => void) | null = null
 
 async function setupEventStream(client: any, ctx: Context, config: Config) {
-  if (isSubscribed) return
-  isSubscribed = true
+  // 先停掉可能仍存活的旧循环，保证只有一个订阅。
+  if (stopActiveStream) stopActiveStream()
+
+  let stopped = false
+  const stop = () => { stopped = true }
+  stopActiveStream = stop
 
   ctx.on('dispose', () => {
-    isSubscribed = false
+    stop()
+    if (stopActiveStream === stop) stopActiveStream = null
   })
 
-  while (isSubscribed) {
+  while (!stopped) {
     try {
       ctx.logger.info('正在启用 OpenCode 事件流订阅...')
       const events = await client.v2.event.subscribe()
 
       for await (const event of events.stream) {
-        if (!isSubscribed) break
+        if (stopped) break
         await handleEvent(ctx, event, config)
       }
 
-      if (isSubscribed) {
+      if (!stopped) {
         ctx.logger.warn('OpenCode 事件流已断开，2 秒后重连...')
         await sleep(2000)
       }
     } catch (error) {
-      if (isSubscribed) {
+      if (!stopped) {
         ctx.logger.warn('OpenCode 事件流连接中断，5秒后尝试重连...', error)
         await sleep(5000)
       }
@@ -1226,15 +1236,26 @@ async function sendStepContent(
   const dedupKey = `final-text:${messageId || 'unknown'}`
   if (sessionState.sentFinalMessages.has(dedupKey)) return
 
+  // 先同步登记去重键，再执行任何 await。
+  // 否则两个并发处理器（例如重复的事件投递）会在 await 窗口内同时通过
+  // 上面的检查，从而把同一段内容各发一次。
+  sessionState.sentFinalMessages.add(dedupKey)
+
   const bot = ctx.bots.find(b => b.platform === sessionState.platform && b.selfId === sessionState.selfId)
   if (!bot) {
+    sessionState.sentFinalMessages.delete(dedupKey)
     ctx.logger.warn(`Bot not found for session ${sessionKey}`)
     return
   }
 
-  const processed = await processAssets(ctx, fullContent)
-  await bot.sendMessage(sessionState.channelId, h.parse(processed), sessionState.guildId)
-  sessionState.sentFinalMessages.add(dedupKey)
+  try {
+    const processed = await processAssets(ctx, fullContent)
+    await bot.sendMessage(sessionState.channelId, h.parse(processed), sessionState.guildId)
+  } catch (error) {
+    // 发送失败时回滚去重键，以便后续重试/回退。
+    sessionState.sentFinalMessages.delete(dedupKey)
+    throw error
+  }
   sessionState.hasStreamed = true
   activeSessions.set(sessionKey, sessionState)
 }
@@ -1538,15 +1559,23 @@ async function handleToolEvent(ctx: Context, event: any, config: Config) {
   const text = formatPart(part, config.showReasoning ?? true)
   if (!text) return
 
+  // 同 sendStepContent：先同步登记去重键，避免并发处理器重复发送。
+  sessionState.sentToolCalls.add(dedupKey)
+
   const bot = ctx.bots.find(b => b.platform === sessionState.platform && b.selfId === sessionState.selfId)
   if (!bot) {
+    sessionState.sentToolCalls.delete(dedupKey)
     ctx.logger.warn(`Bot not found for session ${sessionKey}`)
     return
   }
 
-  const processed = await processAssets(ctx, text)
-  await bot.sendMessage(sessionState.channelId, h.parse(processed), sessionState.guildId)
-  sessionState.sentToolCalls.add(dedupKey)
+  try {
+    const processed = await processAssets(ctx, text)
+    await bot.sendMessage(sessionState.channelId, h.parse(processed), sessionState.guildId)
+  } catch (error) {
+    sessionState.sentToolCalls.delete(dedupKey)
+    throw error
+  }
   sessionState.hasStreamed = true
   sessionState.lastActivity = Date.now()
   activeSessions.set(sessionKey, sessionState)
